@@ -1,0 +1,33 @@
+# Ignore virtual environment
+.venv/
+
+# Ignore zip file
+ClusterAPI.zip
+
+# Ignore environment files
+.env.dev
+.env.prod
+.env
+# Ignore all files in ai_models folder except __init__.py
+app/ai_models/*
+!app/ai_models/__init__.py
+
+
+
+# Deprecated
+test-data
+tests 
+
+
+# Pycache 
+app/__pycache__
+app/core/__pycache__
+app/models/__pycache__
+app/routers/__pycache__
+app/services/__pycache__
+app/schemas/__pycache__
+app/services/Anonymous_clustering/__pycache__
+
+input.json
+output.json
+recycling bin

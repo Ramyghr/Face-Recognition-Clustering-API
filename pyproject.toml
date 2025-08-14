@@ -1,0 +1,41 @@
+[tool.poetry]
+name = "uwas-recognition-sandbox"
+version = "0.1.0"
+description = ""
+authors = ["FireCamp105 <blingo105@gmail.com>"]
+readme = "README.md"
+packages = [
+    { include = "app", from = "." }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<4.0"  
+fastapi = "*"
+uvicorn = { extras = ["standard"], version = "*" }
+python-dotenv = "*"
+pydantic-settings = "*"
+mongoengine = "*"
+motor = "*"
+pymongo = "*"
+beanie = "*"
+python-multipart = "*"
+pillow-heif = "*"
+onnxruntime = "*"
+opencv-python-headless = "*"  # Prevent GUI errors in Docker
+#insightface = "*"
+scikit-learn = "*"
+hdbscan = "*"
+aioboto3 = "*"
+networkx = "*"
+huggingface-hub = "*"
+ultralytics = "*"
+tenacity = "*"
+psutil = "*"
+chromadb = "^1.0.15"
+sentence-transformers = "^5.0.0"
+qdrant-client = "^1.15.1"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
