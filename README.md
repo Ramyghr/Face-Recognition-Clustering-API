@@ -60,30 +60,6 @@ A **FastAPI-based facial recognition and clustering system** integrating:
 
 ---
 
-## 📂 Project Structure
-
-├── app
-│ ├── main.py # Application entrypoint
-│ ├── routers/
-│ │ ├── user_profile.py # User profile endpoints
-│ │ ├── bucket_clustering.py # Clustering endpoints
-│ │ └── cluster_assignment.py # Assignment endpoints
-│ ├── services/
-│ │ └── cluster_linker.py # Assignment logic
-│ ├── db/ # DB operations
-│ ├── models/ # Data models
-│ └── core/ # Config & DB connections
-├── Dockerfile
-├── docker-compose.yaml
-├── poetry.lock
-├── pyproject.toml
-└── README.md
-
-yaml
-Copier
-Modifier
-
----
 
 ## ⚙️ Installation & Setup
 
@@ -99,37 +75,22 @@ Modifier
 git clone https://github.com/your-username/your-repo.git
 cd your-repo
 2. Install Dependencies
-bash
-Copier
-Modifier
 poetry install
 3. Configure Environment
 Create .env or .env.dev:
-
-env
-Copier
-Modifier
 # MongoDB
 MONGODB_URL="mongodb://localhost:27017"
 DATABASE_NAME="face_recognition"
-
 # Qdrant
 QDRANT_URL="http://localhost:6333"
-
 # Wasabi S3
 WASABI_ACCESS_KEY="your-access-key"
 WASABI_SECRET_KEY="your-secret-key"
 4. Start Qdrant with Docker
-bash
-Copier
-Modifier
 docker run --rm -p 6333:6333 -p 6334:6334 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant:latest
 5. Run the API
-bash
-Copier
-Modifier
 poetry run uvicorn app.main:app --reload
 📡 API Overview
 User Profile Endpoints
