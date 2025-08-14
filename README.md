@@ -92,25 +92,40 @@ docker run --rm -p 6333:6333 -p 6334:6334 \
   qdrant/qdrant:latest
 5. Run the API
 poetry run uvicorn app.main:app --reload
-📡 API Overview
-User Profile Endpoints
-Method	Endpoint	Description
-POST	/detect-face	Detect & create user profile
-PUT	/update-face/{user_id}	Update existing profile
-GET	/debug-quality-settings	View detection thresholds
-GET	/debug-profiles	List stored profiles
+```
+## 📡 API Overview
 
-Clustering Endpoints
-Method	Endpoint	Description
-POST	/cluster-bucket-with-db/{bucket}/{sub}	Run clustering
-GET	/verify-fixed-storage/{bucket}/{sub}	Verify Mongo/Qdrant sync
-GET	/cluster-status-db/{bucket}/{sub}	View clustering status
-GET	/cluster-details-db/{bucket}/{sub}/{cluster_id}	Cluster details
+### 🧍 User Profile Endpoints
 
-Cluster Assignment Endpoints
-Method	Endpoint	Description
-POST	/assignments/{bucket}/{sub}	Assign clusters to users
-GET	/assignments/{bucket}/{sub}	View assignments
-GET	/assignments/user/{user_id}	View user’s assignments
-DELETE	/assignments/clustering/{clustering_id}	Delete assignments
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST   | `/detect-face` | Detect a face, validate quality, and create a new user profile |
+| PUT    | `/update-face/{user_id}` | Update an existing profile with a new face image |
+| GET    | `/debug-quality-settings` | View current detection quality thresholds |
+| GET    | `/debug-profiles` | List stored profiles (sanitized) |
+| GET    | `/debug-profile/{user_id}` | Retrieve profile details (sanitized) |
+| DELETE | `/debug-profile/{user_id}` | Delete a profile |
+
+---
+
+### 📦 Clustering Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST   | `/cluster-bucket-with-db/{bucket}/{sub}` | Run face clustering on S3 bucket images |
+| GET    | `/verify-fixed-storage/{bucket}/{sub}` | Verify MongoDB ↔ Qdrant storage consistency |
+| GET    | `/cluster-status-db/{bucket}/{sub}` | View latest clustering status and stats |
+| GET    | `/cluster-details-db/{bucket}/{sub}/{cluster_id}` | Get detailed information for a specific cluster |
+
+---
+
+### 🔗 Cluster Assignment Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST   | `/assignments/{bucket}/{sub}` | Assign clustered faces to known user profiles |
+| GET    | `/assignments/{bucket}/{sub}` | Retrieve all assignments for a specific bucket/sub-bucket |
+| GET    | `/assignments/user/{user_id}` | Retrieve all assignments for a specific user |
+| DELETE | `/assignments/clustering/{clustering_id}` | Delete all assignments for a given clustering ID |
+| GET    | `/assignments/debug/{bucket}/{sub}` | Debug assignment inputs and matching process |
 
