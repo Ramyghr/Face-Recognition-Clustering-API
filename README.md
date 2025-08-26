@@ -72,7 +72,7 @@ A **FastAPI-based facial recognition and clustering system** integrating:
 
 ### 1. Clone the Repo
 ```bash
-git clone https://github.com/your-username/your-repo.git
+git clone https://github.com/Ramyghr/Face-Recognition-Clustering-API.git
 cd your-repo
 2. Install Dependencies
 poetry install
