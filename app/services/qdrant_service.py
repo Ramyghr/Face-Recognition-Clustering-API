@@ -55,7 +55,295 @@ class QdrantService:
                     raise RuntimeError(f"Could not connect to Qdrant: {str(e)}")
                 logger.warning("Qdrant connection attempt %d failed: %s", attempt + 1, str(e)[:200])
                 time.sleep(self.retry_delay)
+    def get_embeddings_by_person_and_clustering_id(self, clustering_id: str, person_id: str):
+        """Get all embeddings for a specific person in a clustering"""
+        try:
+            filter_conditions = {
+                "must": [
+                    {"key": "clustering_id", "match": {"value": clustering_id}},
+                    {"key": "person_id", "match": {"value": person_id}}
+                ]
+            }
+            
+            response = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=filter_conditions,
+                with_payload=True,
+                with_vectors=True,
+                limit=1000
+            )
+            
+            if response and response[0]:
+                return [
+                    {
+                        "id": point.id,
+                        "vector": point.vector,
+                        "payload": point.payload
+                    }
+                    for point in response[0]
+                ]
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error getting embeddings for person {person_id}: {e}")
+            return []
 
+    def get_person_statistics(self, clustering_id: str) -> Dict[str, Any]:
+        """Get statistics about persons in a clustering"""
+        try:
+            # Get all points for this clustering
+            filter_conditions = {
+                "must": [
+                    {"key": "clustering_id", "match": {"value": clustering_id}}
+                ]
+            }
+            
+            response = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=filter_conditions,
+                with_payload=True,
+                with_vectors=False,
+                limit=10000
+            )
+            
+            if not response or not response[0]:
+                return {"total_embeddings": 0, "persons": {}}
+            
+            person_stats = {}
+            total_embeddings = len(response[0])
+            
+            for point in response[0]:
+                payload = point.payload
+                person_id = payload.get("person_id", "unknown")
+                is_owner = payload.get("is_owner_face", "false").lower() == "true"
+                
+                if person_id not in person_stats:
+                    person_stats[person_id] = {
+                        "total_embeddings": 0,
+                        "owner_faces": 0,
+                        "avg_confidence": 0,
+                        "confidences": []
+                    }
+                
+                person_stats[person_id]["total_embeddings"] += 1
+                if is_owner:
+                    person_stats[person_id]["owner_faces"] += 1
+                    
+                try:
+                    confidence = float(payload.get("confidence", "0"))
+                    person_stats[person_id]["confidences"].append(confidence)
+                except:
+                    pass
+            
+            # Calculate averages
+            for person_id, stats in person_stats.items():
+                if stats["confidences"]:
+                    stats["avg_confidence"] = sum(stats["confidences"]) / len(stats["confidences"])
+                del stats["confidences"]  # Remove raw data
+            
+            return {
+                "total_embeddings": total_embeddings,
+                "unique_persons": len(person_stats),
+                "unassigned_faces": person_stats.get("unassigned", {}).get("total_embeddings", 0),
+                "person_distribution": dict(sorted(
+                    person_stats.items(), 
+                    key=lambda x: x[1]["total_embeddings"], 
+                    reverse=True
+                ))
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting person statistics: {e}")
+            return {"total_embeddings": 0, "persons": {}}
+
+    def search_similar_faces_across_persons(self, query_embedding: List[float], clustering_id: str, limit: int = 10) -> List[Dict]:
+        """Search for similar faces across all persons in a clustering"""
+        try:
+            filter_conditions = {
+                "must": [
+                    {"key": "clustering_id", "match": {"value": clustering_id}}
+                ]
+            }
+            
+            search_result = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_embedding,
+                query_filter=filter_conditions,
+                limit=limit,
+                with_payload=True
+            )
+            
+            results = []
+            for hit in search_result:
+                results.append({
+                    "face_id": hit.payload.get("face_id"),
+                    "person_id": hit.payload.get("person_id"),
+                    "image_path": hit.payload.get("image_path"),
+                    "is_owner_face": hit.payload.get("is_owner_face", "false").lower() == "true",
+                    "similarity_score": hit.score,
+                    "confidence": float(hit.payload.get("confidence", "0")),
+                    "quality_score": float(hit.payload.get("quality_score", "0"))
+                })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error searching similar faces: {e}")
+            return []
+
+    def get_owner_faces_for_clustering(self, clustering_id: str) -> List[Dict]:
+        """Get all owner faces (representative faces) for persons in a clustering"""
+        try:
+            filter_conditions = {
+                "must": [
+                    {"key": "clustering_id", "match": {"value": clustering_id}},
+                    {"key": "is_owner_face", "match": {"value": "true"}}
+                ]
+            }
+            
+            response = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=filter_conditions,
+                with_payload=True,
+                with_vectors=True,
+                limit=1000
+            )
+            
+            if response and response[0]:
+                return [
+                    {
+                        "face_id": point.payload.get("face_id"),
+                        "person_id": point.payload.get("person_id"),
+                        "image_path": point.payload.get("image_path"),
+                        "embedding": point.vector,
+                        "confidence": float(point.payload.get("confidence", "0")),
+                        "quality_score": float(point.payload.get("quality_score", "0"))
+                    }
+                    for point in response[0]
+                ]
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error getting owner faces: {e}")
+            return []
+
+    def update_person_assignments(self, face_ids: List[str], new_person_id: str, clustering_id: str) -> bool:
+        """Update person assignments for specific faces"""
+        try:
+            # First, get the points to update
+            filter_conditions = {
+                "must": [
+                    {"key": "clustering_id", "match": {"value": clustering_id}},
+                    {"key": "face_id", "match": {"any": face_ids}}
+                ]
+            }
+            
+            response = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=filter_conditions,
+                with_payload=True,
+                with_vectors=False,
+                limit=len(face_ids)
+            )
+            
+            if not response or not response[0]:
+                logger.warning(f"No points found for face_ids: {face_ids}")
+                return False
+            
+            # Update each point
+            points_to_update = []
+            for point in response[0]:
+                updated_payload = point.payload.copy()
+                updated_payload["person_id"] = new_person_id
+                # Reset owner status when reassigning
+                updated_payload["is_owner_face"] = "false"
+                
+                points_to_update.append({
+                    "id": point.id,
+                    "payload": updated_payload
+                })
+            
+            if points_to_update:
+                # Batch update
+                self.client.set_payload(
+                    collection_name=self.collection_name,
+                    payload={},  # Will be overridden by individual payloads
+                    points=points_to_update
+                )
+                
+                logger.info(f"Updated {len(points_to_update)} faces to person {new_person_id}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating person assignments: {e}")
+            return False
+
+    def delete_person_data(self, clustering_id: str, person_id: str) -> bool:
+        """Delete all data for a specific person in a clustering"""
+        try:
+            filter_conditions = {
+                "must": [
+                    {"key": "clustering_id", "match": {"value": clustering_id}},
+                    {"key": "person_id", "match": {"value": person_id}}
+                ]
+            }
+            
+            # Delete points matching the filter
+            operation_info = self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=filter_conditions
+            )
+            
+            logger.info(f"Deleted person data for {person_id} in clustering {clustering_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting person data: {e}")
+            return False
+
+    def get_clustering_overview(self, clustering_id: str) -> Dict[str, Any]:
+        """Get comprehensive overview of a person-based clustering"""
+        try:
+            person_stats = self.get_person_statistics(clustering_id)
+            owner_faces = self.get_owner_faces_for_clustering(clustering_id)
+            
+            # Calculate additional metrics
+            total_persons = len([p for p in person_stats.get("person_distribution", {}).keys() if p != "unassigned"])
+            total_faces = person_stats.get("total_embeddings", 0)
+            unassigned_faces = person_stats.get("unassigned_faces", 0)
+            
+            # Get top persons by appearance count
+            top_persons = []
+            for person_id, stats in list(person_stats.get("person_distribution", {}).items())[:10]:
+                if person_id != "unassigned":
+                    owner_face = next((f for f in owner_faces if f["person_id"] == person_id), None)
+                    top_persons.append({
+                        "person_id": person_id,
+                        "total_appearances": stats["total_embeddings"],
+                        "avg_confidence": round(stats["avg_confidence"], 3),
+                        "owner_face_id": owner_face["face_id"] if owner_face else None,
+                        "owner_image_path": owner_face["image_path"] if owner_face else None
+                    })
+            
+            return {
+                "clustering_id": clustering_id,
+                "total_persons": total_persons,
+                "total_faces": total_faces,
+                "unassigned_faces": unassigned_faces,
+                "assignment_rate": round((total_faces - unassigned_faces) / total_faces * 100, 1) if total_faces > 0 else 0,
+                "avg_faces_per_person": round(total_faces / total_persons, 1) if total_persons > 0 else 0,
+                "top_persons": top_persons,
+                "owner_faces_count": len(owner_faces)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting clustering overview: {e}")
+            return {
+                "clustering_id": clustering_id,
+                "error": str(e)
+            }
     def _create_url_client(self) -> Optional[QdrantClient]:
         try:
             client = QdrantClient(

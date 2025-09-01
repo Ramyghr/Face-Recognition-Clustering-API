@@ -39,7 +39,48 @@ class PyObjectId(ObjectId):
     def __get_pydantic_json_schema__(cls, field_schema):
         field_schema.update(type="string", example="507f1f77bcf86cd799439011")
 
+class PersonClusterInfo(BaseModel):
+    """Information about a person-based cluster"""
+    person_id: str  # Unique identifier for this person
+    owner_face_id: str  # Face ID of the representative/strongest face
+    owner_embedding: List[float]  # Primary embedding for this person
+    image_paths: List[str]  # All images this person appears in
+    face_ids: List[str]  # All face IDs for this person across images
+    confidence_scores: List[float]  # Confidence for each detection
+    quality_scores: List[float]  # Quality scores for each face
+    size: int  # Total number of images this person appears in
+    avg_confidence: float  # Average confidence across all detections
+    best_quality_score: float  # Highest quality score among all faces
+
+class ImageOverlapStats(BaseModel):
+    """Statistics about how images overlap across person clusters"""
+    single_person_images: int = 0
+    multi_person_images: int = 0
+    max_persons_per_image: int = 0
+    avg_persons_per_image: float = 0.0  # Changed from int to float
+
+class PersonBasedClusteringResult(Document):
+    """Results from person-based clustering where each person gets their own cluster"""
+    bucket_path: str
+    person_clusters: List[PersonClusterInfo] = []
+    unassigned_faces: List[str] = []
+    unassigned_face_ids: List[str] = []
+    total_images: int = 0
+    total_faces: int = 0
+    total_persons: int = 0
+    image_overlap_stats: ImageOverlapStats = Field(default_factory=ImageOverlapStats)
+    processing_stats: Dict[str, Any] = {}
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    
+    class Settings:
+        name = "person_based_clustering_results"
+        indexes = [
+            IndexModel([("bucket_path", 1), ("timestamp", -1)], name="bucket_timestamp_idx"),
+            IndexModel([("total_persons", -1)], name="persons_count_idx")
+        ]
+
 class ClusterInfo(BaseModel):
+    """Legacy cluster info - kept for backward compatibility"""
     cluster_id: str
     image_paths: List[str]
     face_ids: List[str]
@@ -47,9 +88,10 @@ class ClusterInfo(BaseModel):
     centroid: Optional[List[float]] = None
 
 class ClusterResultResponse(BaseModel):
+    """Updated response model for person-based clustering"""
     bucket: str
-    clusters: List[List[str]]  # List of image paths in each cluster
-    noise: List[str]  # List of image paths marked as noise
+    person_clusters: List[Dict[str, Any]]  # Person-based clusters
+    unassigned: List[str]  # Unassigned images
     timestamp: datetime
     stats: Dict[str, Any]  # Processing statistics dictionary
 
@@ -57,9 +99,10 @@ class ClusterResultResponse(BaseModel):
         arbitrary_types_allowed=True,
         json_encoders={ObjectId: str, datetime: lambda dt: dt.isoformat()},
     )
+
 class FaceEmbeddingBase(Document):
-    """Fixed version of FaceEmbedding that prevents _id conflicts"""
-    id: ObjectId = Field(default_factory=ObjectId, alias="_id")  # Explicit ObjectId
+    """Enhanced face embedding with person assignment"""
+    id: ObjectId = Field(default_factory=ObjectId, alias="_id")
     face_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     clustering_id: Optional[PyObjectId] = None
     image_path: str
@@ -68,7 +111,11 @@ class FaceEmbeddingBase(Document):
     confidence: Optional[float] = None
     quality_score: Optional[float] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    cluster_id: str = Field(default="unassigned")
+    
+    # Person-based clustering fields
+    person_id: Optional[str] = None  # Which person this face belongs to
+    is_owner_face: bool = False  # True if this is the representative face for the person
+    cluster_confidence: Optional[float] = None  # Confidence of assignment to person
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -76,18 +123,19 @@ class FaceEmbeddingBase(Document):
     )
 
     class Settings:
-        name = "face_embeddings_fixed"
+        name = "face_embeddings_enhanced"
         indexes = [
             IndexModel([("image_path", 1)]),
-            IndexModel([("cluster_id", 1)]),
+            IndexModel([("person_id", 1)]),
             IndexModel([("timestamp", -1)]),
             IndexModel([("face_id", 1)], unique=True),
-            IndexModel([("clustering_id", 1)])
+            IndexModel([("clustering_id", 1)]),
+            IndexModel([("is_owner_face", 1)])
         ]
-    
 
+# Keep the original ClusteringResult for backward compatibility
 class ClusteringResult(Document):
-    id: ObjectId = Field(default_factory=ObjectId, alias="_id")  # Explicit ObjectId
+    id: ObjectId = Field(default_factory=ObjectId, alias="_id")
     bucket_path: str
     clusters: List[ClusterInfo]
     noise: List[str]

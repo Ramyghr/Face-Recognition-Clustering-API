@@ -1,103 +1,715 @@
-#db/face_clustering_operations.py
+#db/person_clustering_operations.py
 from beanie import Document, init_beanie 
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, Tuple
 from pymongo import IndexModel
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from app.services.qdrant_service import qdrant_service
-from app.models.face_clustering_models import FaceEmbeddingBase as FaceEmbedding, ClusterInfo, ClusteringResult
+from app.models.face_clustering_models import FaceEmbeddingBase as FaceEmbedding, PersonClusterInfo, PersonBasedClusteringResult
 from app.core.config import settings
 from app.models.user_profile import UserProfile
+import numpy as np
+from collections import defaultdict
+from app.models.face_clustering_models import FaceEmbeddingBase as FaceEmbedding, ClusterInfo, ClusteringResult
+
 logger = logging.getLogger(__name__)
+
 # Global database connection
 _database_instance = None
 # Cache for dynamic models
 _model_cache = {}
+
+def _convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to native Python types for MongoDB/Pydantic compatibility
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: _convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_convert_numpy_types(item) for item in obj)
+    else:
+        return obj
+
 def _coerce_timestamp_in_raw(raw: dict) -> dict:
     """Ensure raw['timestamp'] is a datetime (fixes legacy 'timestamp' string)."""
     ts = raw.get("timestamp")
     if not isinstance(ts, datetime):
-        # If it's a string like "timestamp" or missing, force a sane datetime
         raw["timestamp"] = datetime.utcnow()
     return raw
 
-async def get_clustering_by_id(clustering_id: str):
-    """
-    Load a clustering doc by _id from the base collection first.
-    If not found, try dynamic collection fallback.
-    """
-    # 1) Try base collection (ClusteringResult.Settings.name == "clustering_results")
+def get_person_face_embedding_model(bucket_name: str, sub_bucket: str):
+    """Create dynamic FaceEmbedding model for person-based clustering"""
+    collection_name = f"person_faces_{bucket_name}_{sub_bucket}".replace("/", "_").replace("-", "_").lower()
+    
+    cache_key = f"person_face_embedding_{collection_name}"
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
+    
+    class DynamicPersonFaceEmbedding(FaceEmbedding):
+        class Settings:
+            name = collection_name
+            indexes = [
+                IndexModel([("image_path", 1)], name=f"{collection_name}_image_path_idx"),
+                IndexModel([("person_id", 1)], name=f"{collection_name}_person_id_idx"),
+                IndexModel([("timestamp", -1)], name=f"{collection_name}_timestamp_idx"),
+                IndexModel([("face_id", 1)], name=f"{collection_name}_face_id_idx", unique=True),
+                IndexModel([("clustering_id", 1)], name=f"{collection_name}_clustering_id_idx"),
+                IndexModel([("is_owner_face", 1)], name=f"{collection_name}_is_owner_idx"),
+                IndexModel([("person_id", 1), ("is_owner_face", -1)], name=f"{collection_name}_person_owner_idx")
+            ]
+    
+    _model_cache[cache_key] = DynamicPersonFaceEmbedding
+    return DynamicPersonFaceEmbedding
+
+def get_person_clustering_result_model(bucket_name: str, sub_bucket: str):
+    """Create dynamic PersonBasedClusteringResult model"""
+    collection_name = f"person_clustering_{bucket_name}_{sub_bucket}".replace("/", "_").replace("-", "_").lower()
+    
+    cache_key = f"person_clustering_result_{collection_name}"
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
+    
+    class DynamicPersonClusteringResult(PersonBasedClusteringResult):
+        class Settings:
+            name = collection_name
+            indexes = [
+                IndexModel([("bucket_path", 1), ("timestamp", -1)], name=f"{collection_name}_bucket_timestamp_idx"),
+                IndexModel([("total_persons", -1)], name=f"{collection_name}_persons_count_idx")
+            ]
+    
+    _model_cache[cache_key] = DynamicPersonClusteringResult
+    return DynamicPersonClusteringResult
+
+async def initialize_dynamic_model(model_class):
+    """Initialize a dynamic model by creating its collection if needed and setting up direct collection access"""
     try:
-        oid = ObjectId(clustering_id)
-    except Exception:
-        raise ValueError(f"Invalid clustering_id: {clustering_id}")
+        client = AsyncIOMotorClient(settings.MONGODB_URL)
+        db = client[settings.DATABASE_NAME]
+        collection_name = model_class.Settings.name
 
-    doc = await ClusteringResult.get(oid)
-    if doc:
-        return doc
+        # Create collection if it doesn't exist
+        existing_collections = await db.list_collection_names()
+        if collection_name not in existing_collections:
+            await db.create_collection(collection_name)
+            logger.info(f"Created collection: {collection_name}")
 
-    # 1b) Fallback via raw (handles malformed timestamp)
-    client = AsyncIOMotorClient(settings.MONGODB_URL)
-    db = client[settings.DATABASE_NAME]
-    raw = await db[ClusteringResult.Settings.name].find_one({"_id": oid})
-    if raw:
-        raw = _coerce_timestamp_in_raw(raw)
-        return ClusteringResult.model_validate(raw)
-
-    # 2) Dynamic collection fallback (if your pipeline saved in per-bucket coll)
-    # We don't know the bucket/sub_bucket here, so we scan a handful of dynamic collections
-    # If you keep many, you can skip this block to avoid scanning.
-    for name in await db.list_collection_names():
-        if not name.startswith("clustering_results_"):
-            continue
-        raw = await db[name].find_one({"_id": oid})
-        if raw:
-            raw = _coerce_timestamp_in_raw(raw)
+        # Set up direct collection access for the model
+        collection = db[collection_name]
+        
+        # Store collection reference directly on model class
+        model_class._motor_collection = collection
+        model_class._collection = collection
+        
+        # Create indexes manually
+        indexes = getattr(model_class.Settings, "indexes", None)
+        if indexes:
+            to_create = []
+            
+            # Get existing indexes to avoid duplicates
             try:
-                # Validate against the base model; it shares the same schema
-                return ClusteringResult.model_validate(raw)
+                existing_indexes = await collection.list_indexes().to_list(length=None)
+                existing_index_names = {idx.get('name', '') for idx in existing_indexes}
             except Exception:
-                # If dynamic schema diverges, just return raw or raise
-                return ClusteringResult.model_validate(raw)
+                existing_index_names = set()
+            
+            for idx in indexes:
+                try:
+                    if isinstance(idx, IndexModel):
+                        if idx.document.get('name', '') not in existing_index_names:
+                            to_create.append(idx)
+                    elif isinstance(idx, (list, tuple)):
+                        index_model = IndexModel(idx)
+                        if index_model.document.get('name', '') not in existing_index_names:
+                            to_create.append(index_model)
+                    elif isinstance(idx, dict) and "keys" in idx:
+                        opts = {k: v for k, v in idx.items() if k != "keys"}
+                        index_model = IndexModel(idx["keys"], **opts)
+                        if index_model.document.get('name', '') not in existing_index_names:
+                            to_create.append(index_model)
+                except Exception as idx_error:
+                    logger.warning(f"Index preparation error: {idx_error}")
+                    continue
 
-    return None
+            if to_create:
+                try:
+                    await collection.create_indexes(to_create)
+                    logger.info(f"Created {len(to_create)} indexes for {collection_name}")
+                except Exception as idx_error:
+                    logger.warning(f"Index creation warning for {collection_name}: {idx_error}")
 
-async def get_latest_clustering_for_bucket(bucket_name: str, sub_bucket: str):
-    """
-    Return the latest clustering for f"{bucket}/{sub_bucket}".
-    Prefer base collection; fall back to dynamic collection if needed.
-    """
-    bucket_path = f"{bucket_name}/{sub_bucket}"
+        # Verify collection access
+        try:
+            await collection.find_one({})
+            logger.info(f"Successfully initialized dynamic model: {collection_name}")
+            return True
+        except Exception as verify_error:
+            logger.error(f"Model verification failed for {collection_name}: {verify_error}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Dynamic model initialization error: {e}")
+        return False
 
-    # 1) Base collection, proper datetime timestamps
-    doc = await ClusteringResult.find(
-        {"bucket_path": bucket_path, "timestamp": {"$type": 9}}
-    ).sort([("timestamp", -1)]).limit(1).first_or_none()
-    if doc:
-        return doc
+class PersonBasedClusteringDB:
+    """Database operations for person-based face clustering"""
+    
+    @staticmethod
+    async def save_person_face_metadata(
+        bucket_name: str, 
+        sub_bucket: str,
+        image_path: str,
+        face_id: str,
+        person_id: Optional[str] = None,
+        is_owner_face: bool = False,
+        bbox: Optional[List[float]] = None,
+        confidence: Optional[float] = None,
+        quality_score: Optional[float] = None,
+        cluster_confidence: Optional[float] = None,
+        clustering_id: Optional[ObjectId] = None
+    ) -> Optional[str]:
+        """Save face metadata with person assignment using direct MongoDB operations"""
+        try:
+            PersonFaceModel = get_person_face_embedding_model(bucket_name, sub_bucket)
+            
+            # Initialize the model first
+            ok = await initialize_dynamic_model(PersonFaceModel)
+            if not ok:
+                raise RuntimeError(f"Failed to initialize PersonFaceModel for {bucket_name}/{sub_bucket}")
+            
+            # Create document data directly
+            doc_data = {
+                "_id": ObjectId(),
+                "face_id": face_id,
+                "image_path": image_path,
+                "person_id": person_id,
+                "is_owner_face": is_owner_face,
+                "bbox": bbox,
+                "confidence": confidence,
+                "quality_score": quality_score,
+                "cluster_confidence": cluster_confidence,
+                "clustering_id": clustering_id,
+                "embedding": [],  # Empty, stored in Qdrant
+                "timestamp": datetime.utcnow()
+            }
+            
+            # Insert directly using motor collection
+            await PersonFaceModel._motor_collection.insert_one(doc_data)
+            logger.info(f"Saved person face metadata: {face_id}, person: {person_id}, owner: {is_owner_face}")
+            return face_id
+            
+        except Exception as e:
+            logger.error(f"Error saving person face metadata: {str(e)}", exc_info=True)
+            return None
 
-    # 1b) Base collection, raw fallback if timestamp is a bad string
-    client = AsyncIOMotorClient(settings.MONGODB_URL)
-    db = client[settings.DATABASE_NAME]
-    raw = await db[ClusteringResult.Settings.name].find_one(
-        {"bucket_path": bucket_path}, sort=[("_id", -1)]
-    )
-    if raw:
-        raw = _coerce_timestamp_in_raw(raw)
-        return ClusteringResult.model_validate(raw)
+    @staticmethod
+    async def save_person_clustering_result(
+        bucket_name: str,
+        sub_bucket: str,
+        person_clusters: List[PersonClusterInfo],
+        unassigned_faces: List[str],
+        unassigned_face_ids: List[str],
+        total_images: int,
+        total_faces: int,
+        processing_stats: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ObjectId]:
+        """Save person-based clustering results using direct MongoDB operations"""
+        try:
+            # Calculate overlap statistics
+            image_appearances = defaultdict(int)
+            for cluster in person_clusters:
+                for img_path in cluster.image_paths:
+                    image_appearances[img_path] += 1
+            
+            # Convert numpy types to native Python types
+            overlap_stats = {
+                "single_person_images": sum(1 for count in image_appearances.values() if count == 1),
+                "multi_person_images": sum(1 for count in image_appearances.values() if count > 1),
+                "max_persons_per_image": max(image_appearances.values()) if image_appearances else 0,
+                "avg_persons_per_image": float(np.mean(list(image_appearances.values()))) if image_appearances else 0.0
+            }
+            
+            # Normalize processing stats
+            processing_stats = processing_stats or {}
+            ts = processing_stats.get("timestamp")
+            if ts is None:
+                processing_stats["timestamp"] = datetime.utcnow()
+            elif isinstance(ts, str):
+                try:
+                    processing_stats["timestamp"] = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    processing_stats["timestamp"] = datetime.utcnow()
 
-    # 2) Dynamic per-bucket collection fallback
-    dyn_name = f"clustering_results_{bucket_name}_{sub_bucket}".replace("/", "_").replace("-", "_").lower()
-    if dyn_name in await db.list_collection_names():
-        raw = await db[dyn_name].find_one({}, sort=[("_id", -1)])
-        if raw:
-            raw = _coerce_timestamp_in_raw(raw)
-            return ClusteringResult.model_validate(raw)
+            PersonClusteringModel = get_person_clustering_result_model(bucket_name, sub_bucket)
+            
+            # Initialize the dynamic model
+            ok = await initialize_dynamic_model(PersonClusteringModel)
+            if not ok:
+                raise RuntimeError(f"Failed to initialize collection for {bucket_name}/{sub_bucket}")
+            
+            # Convert PersonClusterInfo objects to dict format
+            person_clusters_dict = []
+            for cluster in person_clusters:
+                cluster_dict = {
+                    "person_id": cluster.person_id,
+                    "owner_face_id": cluster.owner_face_id,
+                    "owner_embedding": cluster.owner_embedding,
+                    "image_paths": cluster.image_paths,
+                    "face_ids": cluster.face_ids,
+                    "confidence_scores": [float(x) for x in cluster.confidence_scores] if cluster.confidence_scores else [],
+                    "quality_scores": [float(x) for x in cluster.quality_scores] if cluster.quality_scores else [],
+                    "size": cluster.size,
+                    "avg_confidence": float(cluster.avg_confidence),
+                    "best_quality_score": float(cluster.best_quality_score)
+                }
+                person_clusters_dict.append(cluster_dict)
 
-    return None
+            # Create document data directly
+            doc_id = ObjectId()
+            doc_data = {
+                "_id": doc_id,
+                "bucket_path": f"{bucket_name}/{sub_bucket}",
+                "person_clusters": person_clusters_dict,
+                "unassigned_faces": unassigned_faces,
+                "unassigned_face_ids": unassigned_face_ids,
+                "total_images": total_images,
+                "total_faces": total_faces,
+                "total_persons": len(person_clusters),
+                "image_overlap_stats": overlap_stats,
+                "processing_stats": _convert_numpy_types(processing_stats),
+                "timestamp": datetime.utcnow(),
+            }
+
+            # Insert directly using motor collection
+            await PersonClusteringModel._motor_collection.insert_one(doc_data)
+            logger.info("Saved person clustering result: %s", str(doc_id))
+            return doc_id
+
+        except Exception as e:
+            logger.error("Error saving person clustering result: %s", e, exc_info=True)
+            return None
+
+    @staticmethod
+    async def save_complete_person_clustering_pipeline(
+        bucket_name: str,
+        sub_bucket: str,
+        person_clusters: Dict[str, Dict],  # person_id -> cluster data
+        unassigned_faces: List[str],
+        face_id_mapping: Dict[str, str],  # image_path -> face_id
+        face_metadata: Dict[str, Dict],   # face_id -> metadata
+        embeddings_data: Dict[str, List[float]],  # face_id -> embedding
+        processing_stats: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ObjectId]:
+        """Complete pipeline for person-based clustering with proper face_id mapping"""
+        try:
+            logger.info("Starting person-based clustering pipeline for %s/%s", bucket_name, sub_bucket)
+
+            # Create reverse mapping for lookups: face_id -> image_path
+            face_id_to_image_path = {face_id: image_path for image_path, face_id in face_id_mapping.items()}
+
+            # 1) Save face metadata for all faces
+            all_face_ids = set()
+            for person_id, cluster_data in person_clusters.items():
+                for face_id in cluster_data["face_ids"]:
+                    all_face_ids.add(face_id)
+                    
+                    # Check if this is the owner face
+                    is_owner = face_id == cluster_data["owner_face_id"]
+                    
+                    # Get image path using reverse lookup
+                    image_path = face_id_to_image_path.get(face_id)
+                    
+                    if not image_path:
+                        logger.warning(f"No image path found for face_id: {face_id}")
+                        continue
+                    
+                    metadata = face_metadata.get(face_id, {})
+                    
+                    saved_id = await PersonBasedClusteringDB.save_person_face_metadata(
+                        bucket_name=bucket_name,
+                        sub_bucket=sub_bucket,
+                        image_path=image_path,
+                        face_id=face_id,
+                        person_id=person_id,
+                        is_owner_face=is_owner,
+                        bbox=metadata.get("bbox"),
+                        confidence=metadata.get("confidence"),
+                        quality_score=metadata.get("quality_score"),
+                        cluster_confidence=metadata.get("cluster_confidence", metadata.get("confidence")),
+                        clustering_id=None,  # Will be set after clustering result is saved
+                    )
+                    
+                    if not saved_id:
+                        logger.warning(f"Failed to save metadata for face_id: {face_id}")
+
+            # Add unassigned faces
+            for image_path in unassigned_faces:
+                face_id = face_id_mapping.get(image_path)
+                if face_id:
+                    all_face_ids.add(face_id)
+                    metadata = face_metadata.get(face_id, {})
+                    
+                    saved_id = await PersonBasedClusteringDB.save_person_face_metadata(
+                        bucket_name=bucket_name,
+                        sub_bucket=sub_bucket,
+                        image_path=image_path,
+                        face_id=face_id,
+                        person_id=None,  # Unassigned
+                        is_owner_face=False,
+                        bbox=metadata.get("bbox"),
+                        confidence=metadata.get("confidence"),
+                        quality_score=metadata.get("quality_score"),
+                        clustering_id=None,
+                    )
+                    
+                    if not saved_id:
+                        logger.warning(f"Failed to save unassigned face metadata for: {image_path}")
+
+            # 2) Prepare PersonClusterInfo objects with numpy type conversion
+            person_cluster_infos = []
+            for person_id, cluster_data in person_clusters.items():
+                # Convert numpy types to native Python types
+                confidence_scores = cluster_data.get("confidence_scores", [])
+                quality_scores = cluster_data.get("quality_scores", [])
+                
+                # Ensure all values are native Python types
+                avg_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.0
+                best_quality = float(max(quality_scores)) if quality_scores else 0.0
+                
+                cluster_info = PersonClusterInfo(
+                    person_id=person_id,
+                    owner_face_id=cluster_data["owner_face_id"],
+                    owner_embedding=cluster_data.get("owner_embedding", []),
+                    image_paths=cluster_data["image_paths"],
+                    face_ids=cluster_data["face_ids"],
+                    confidence_scores=[float(x) for x in confidence_scores] if confidence_scores else [],
+                    quality_scores=[float(x) for x in quality_scores] if quality_scores else [],
+                    size=len(cluster_data["image_paths"]),
+                    avg_confidence=avg_confidence,
+                    best_quality_score=best_quality
+                )
+                person_cluster_infos.append(cluster_info)
+
+            # 3) Calculate totals
+            total_images = len(set(face_id_mapping.keys()))  # Unique images
+            total_faces = len(all_face_ids)
+            unassigned_face_ids = [face_id_mapping.get(path) for path in unassigned_faces if face_id_mapping.get(path)]
+
+            # 4) Save clustering result
+            clustering_result_id = await PersonBasedClusteringDB.save_person_clustering_result(
+                bucket_name=bucket_name,
+                sub_bucket=sub_bucket,
+                person_clusters=person_cluster_infos,
+                unassigned_faces=unassigned_faces,
+                unassigned_face_ids=unassigned_face_ids,
+                total_images=total_images,
+                total_faces=total_faces,
+                processing_stats=processing_stats,
+            )
+
+            if not clustering_result_id:
+                raise RuntimeError("Failed to save person clustering result")
+
+            # 5) Update face metadata with clustering_id
+            await PersonBasedClusteringDB.update_faces_with_clustering_id(
+                bucket_name=bucket_name,
+                sub_bucket=sub_bucket,
+                face_ids=list(all_face_ids),
+                clustering_id=clustering_result_id,
+            )
+
+            # 6) Save embeddings to Qdrant with person assignments
+            qdrant_success = await PersonBasedClusteringDB.save_person_embeddings_to_qdrant(
+                clustering_id=str(clustering_result_id),
+                bucket_name=bucket_name,
+                sub_bucket=sub_bucket,
+                person_clusters=person_clusters,
+                unassigned_faces=unassigned_faces,
+                face_id_mapping=face_id_mapping,
+                face_metadata=face_metadata,
+                embeddings_data=embeddings_data,
+            )
+
+            if not qdrant_success:
+                logger.warning("Qdrant storage failed, but MongoDB metadata saved")
+
+            logger.info("Person clustering pipeline completed: %s", str(clustering_result_id))
+            return clustering_result_id
+
+        except Exception as e:
+            logger.error("Error in person clustering pipeline: %s", e, exc_info=True)
+            return None
+
+    @staticmethod
+    async def save_person_embeddings_to_qdrant(
+        clustering_id: str,
+        bucket_name: str,
+        sub_bucket: str,
+        person_clusters: Dict[str, Dict],
+        unassigned_faces: List[str],
+        face_id_mapping: Dict[str, str],
+        face_metadata: Dict[str, Dict],
+        embeddings_data: Dict[str, List[float]],
+    ) -> bool:
+        """Save person-based embeddings to Qdrant with enhanced metadata"""
+        try:
+            logger.info(f"[QDRANT] Saving person-based embeddings for clustering {clustering_id}")
+            
+            # Create reverse mapping for lookups
+            face_id_to_image_path = {face_id: image_path for image_path, face_id in face_id_mapping.items()}
+            
+            embeddings = []
+            payloads = []
+            
+            # Process person clusters
+            for person_id, cluster_data in person_clusters.items():
+                for i, face_id in enumerate(cluster_data["face_ids"]):
+                    if face_id not in embeddings_data:
+                        logger.warning(f"No embedding found for face_id: {face_id}")
+                        continue
+                    
+                    # Find image path for this face
+                    image_path = face_id_to_image_path.get(face_id)
+                    
+                    if not image_path:
+                        logger.warning(f"No image path found for face_id: {face_id}")
+                        continue
+                    
+                    embedding = embeddings_data[face_id]
+                    metadata = face_metadata.get(face_id, {})
+                    is_owner = face_id == cluster_data["owner_face_id"]
+                    
+                    embeddings.append(embedding)
+                    
+                    payload = {
+                        "face_id": face_id,
+                        "image_path": f"{bucket_name}/{image_path}",
+                        "person_id": person_id,
+                        "is_owner_face": str(is_owner),
+                        "clustering_id": clustering_id,
+                        "bucket_name": bucket_name,
+                        "sub_bucket": sub_bucket,
+                        "bbox": str(metadata.get("bbox", [])),
+                        "confidence": str(metadata.get("confidence", 0.0)),
+                        "quality_score": str(metadata.get("quality_score", 0.0)),
+                        "cluster_confidence": str(metadata.get("cluster_confidence", metadata.get("confidence", 0.0)))
+                    }
+                    payloads.append(payload)
+            
+            # Process unassigned faces
+            for image_path in unassigned_faces:
+                face_id = face_id_mapping.get(image_path)
+                if not face_id or face_id not in embeddings_data:
+                    continue
+                
+                embedding = embeddings_data[face_id]
+                metadata = face_metadata.get(face_id, {})
+                
+                embeddings.append(embedding)
+                
+                payload = {
+                    "face_id": face_id,
+                    "image_path": f"{bucket_name}/{image_path}",
+                    "person_id": "unassigned",
+                    "is_owner_face": "false",
+                    "clustering_id": clustering_id,
+                    "bucket_name": bucket_name,
+                    "sub_bucket": sub_bucket,
+                    "bbox": str(metadata.get("bbox", [])),
+                    "confidence": str(metadata.get("confidence", 0.0)),
+                    "quality_score": str(metadata.get("quality_score", 0.0)),
+                    "cluster_confidence": "0.0"
+                }
+                payloads.append(payload)
+            
+            # Batch insert to Qdrant
+            if embeddings:
+                success = qdrant_service.add_face_embeddings_with_payloads(
+                    embeddings=embeddings,
+                    payloads=payloads
+                )
+                
+                if success:
+                    logger.info(f"[QDRANT] Successfully saved {len(embeddings)} person-based embeddings")
+                    return True
+                else:
+                    logger.error(f"[QDRANT] Failed to save embeddings")
+                    return False
+            else:
+                logger.warning(f"[QDRANT] No valid embeddings to save")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[QDRANT] Error saving person embeddings: {e}")
+            return False
+
+    @staticmethod
+    async def update_faces_with_clustering_id(
+        bucket_name: str,
+        sub_bucket: str,
+        face_ids: List[str],
+        clustering_id: ObjectId
+    ) -> bool:
+        """Update face metadata with clustering_id reference using direct MongoDB operations"""
+        try:
+            PersonFaceModel = get_person_face_embedding_model(bucket_name, sub_bucket)
+            
+            # Use direct MongoDB update operation
+            result = await PersonFaceModel._motor_collection.update_many(
+                {"face_id": {"$in": face_ids}},
+                {"$set": {"clustering_id": clustering_id}}
+            )
+            
+            updated_count = result.modified_count
+            logger.info(f"Updated {updated_count}/{len(face_ids)} face metadata with clustering_id {clustering_id}")
+            return updated_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error updating faces with clustering_id: {e}")
+            return False
+
+    @staticmethod
+    async def get_latest_person_clustering_result(bucket_name: str, sub_bucket: str):
+        """Get the most recent person-based clustering result"""
+        try:
+            path = f"{bucket_name}/{sub_bucket}"
+            PersonClusteringModel = get_person_clustering_result_model(bucket_name, sub_bucket)
+            await initialize_dynamic_model(PersonClusteringModel)
+
+            # Use direct MongoDB query
+            raw = await PersonClusteringModel._motor_collection.find_one(
+                {"bucket_path": path},
+                sort=[("timestamp", -1)]
+            )
+            
+            if not raw:
+                return None
+
+            # Coerce timestamp if needed
+            ts = raw.get("timestamp")
+            if not isinstance(ts, datetime):
+                raw["timestamp"] = datetime.utcnow()
+
+            # Create model instance manually
+            doc = PersonBasedClusteringResult.model_validate(raw)
+            return doc
+            
+        except Exception as e:
+            logger.error("Error getting person clustering result: %s", e, exc_info=True)
+            return None
+
+    @staticmethod
+    async def get_person_cluster_details(bucket_name: str, sub_bucket: str, person_id: str):
+        """Get detailed information about a specific person's cluster"""
+        try:
+            PersonFaceModel = get_person_face_embedding_model(bucket_name, sub_bucket)
+            await initialize_dynamic_model(PersonFaceModel)
+            
+            # Use direct MongoDB query
+            person_faces = await PersonFaceModel._motor_collection.find(
+                {"person_id": person_id},
+                {
+                    "face_id": 1,
+                    "image_path": 1,
+                    "bbox": 1,
+                    "confidence": 1,
+                    "quality_score": 1,
+                    "is_owner_face": 1,
+                    "cluster_confidence": 1,
+                    "timestamp": 1
+                }
+            ).to_list(length=None)
+            
+            if not person_faces:
+                return None
+            
+            # Get owner face
+            owner_face = next((f for f in person_faces if f.get("is_owner_face")), person_faces[0])
+            
+            return {
+                "person_id": person_id,
+                "total_appearances": len(person_faces),
+                "owner_face": {
+                    "face_id": owner_face["face_id"],
+                    "image_path": owner_face["image_path"],
+                    "confidence": owner_face.get("confidence"),
+                    "quality_score": owner_face.get("quality_score")
+                },
+                "all_appearances": [
+                    {
+                        "face_id": face["face_id"],
+                        "image_path": face["image_path"],
+                        "confidence": face.get("confidence"),
+                        "quality_score": face.get("quality_score"),
+                        "is_owner": face.get("is_owner_face", False),
+                        "cluster_confidence": face.get("cluster_confidence"),
+                        "bbox": face.get("bbox")
+                    } for face in person_faces
+                ],
+                "image_paths": [face["image_path"] for face in person_faces],
+                "avg_confidence": float(np.mean([face.get("confidence", 0) for face in person_faces])),
+                "best_quality": float(max([face.get("quality_score", 0) for face in person_faces]))
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting person cluster details: {e}")
+            return None
+
+    @staticmethod
+    async def get_clustering_statistics(bucket_name: str, sub_bucket: str):
+        """Get comprehensive statistics about person-based clustering"""
+        try:
+            clustering_result = await PersonBasedClusteringDB.get_latest_person_clustering_result(bucket_name, sub_bucket)
+            if not clustering_result:
+                return None
+
+            PersonFaceModel = get_person_face_embedding_model(bucket_name, sub_bucket)
+            
+            # Get face counts per person
+            person_stats = []
+            for cluster in clustering_result.person_clusters:
+                person_stats.append({
+                    "person_id": cluster["person_id"] if isinstance(cluster, dict) else cluster.person_id,
+                    "total_appearances": cluster["size"] if isinstance(cluster, dict) else cluster.size,
+                    "avg_confidence": float(cluster["avg_confidence"]) if isinstance(cluster, dict) else float(cluster.avg_confidence),
+                    "best_quality": float(cluster["best_quality_score"]) if isinstance(cluster, dict) else float(cluster.best_quality_score),
+                    "owner_face_id": cluster["owner_face_id"] if isinstance(cluster, dict) else cluster.owner_face_id
+                })
+            
+            # Sort by appearances (most appearances first)
+            person_stats.sort(key=lambda x: x["total_appearances"], reverse=True)
+            
+            # Convert all potentially problematic types
+            stats = {
+                "clustering_id": str(clustering_result.id),
+                "bucket_path": clustering_result.bucket_path,
+                "timestamp": clustering_result.timestamp,
+                "total_persons": int(clustering_result.total_persons),
+                "total_images": int(clustering_result.total_images),
+                "total_faces": int(clustering_result.total_faces),
+                "unassigned_faces": len(clustering_result.unassigned_faces),
+                "image_overlap_stats": _convert_numpy_types(clustering_result.image_overlap_stats),
+                "person_statistics": person_stats[:10],  # Top 10 persons
+                "processing_stats": _convert_numpy_types(clustering_result.processing_stats)
+            }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting clustering statistics: {e}")
+            return None
+
+# Keep database initialization functions compatible
 async def get_database():
     """Get or create database instance"""
     global _database_instance
@@ -108,70 +720,22 @@ async def get_database():
         # Initialize base models with the database
         await init_beanie(
             database=_database_instance,
-            document_models=[FaceEmbedding, ClusteringResult, UserProfile]
+            document_models=[FaceEmbedding, PersonBasedClusteringResult, UserProfile]
         )
     return _database_instance
 
-async def initialize_dynamic_model(model_class):
-    """Initialize a dynamic model by creating its collection if needed - FIXED"""
+async def init_person_clustering_db():
+    """Initialize the person-based clustering database collections"""
     try:
-        client = AsyncIOMotorClient(settings.MONGODB_URL)
-        db = client[settings.DATABASE_NAME]
-        collection_name = model_class.Settings.name
-
-        # Create collection if it doesn't exist
-        if collection_name not in await db.list_collection_names():
-            await db.create_collection(collection_name)
-
-        # Create indexes (handle proper IndexModel usage)
-        indexes = getattr(model_class.Settings, "indexes", None)
-        if indexes:
-            collection = db[collection_name]
-            to_create = []
-            for idx in indexes:
-                if isinstance(idx, IndexModel):
-                    to_create.append(idx)
-                elif isinstance(idx, (list, tuple)):
-                    # allow [('field', 1)] style
-                    to_create.append(IndexModel(idx))
-                elif isinstance(idx, dict) and "keys" in idx:
-                    # legacy dict format: {"keys": [("field", 1)], "unique": True, ...}
-                    opts = {k: v for k, v in idx.items() if k != "keys"}
-                    to_create.append(IndexModel(idx["keys"], **opts))
-                else:
-                    logger.warning(f"Skipping unexpected index spec: {idx!r}")
-
-            if to_create:
-                await collection.create_indexes(to_create)  # <-- the correct API for IndexModel
-
+        await get_database()
+        logger.info("Person clustering database initialized successfully")
         return True
     except Exception as e:
-        logger.error(f"Dynamic model initialization error: {e}")
-        return False
-async def cleanup_problem_collections():
-    """Clean up collections that have the '_id' problem"""
-    try:
-        client = AsyncIOMotorClient(settings.MONGODB_URL)
-        db = client[settings.DATABASE_NAME]
-        
-        collections = await db.list_collection_names()
-        
-        for collection_name in collections:
-            if "face_embeddings" in collection_name:
-                # Check if collection has documents with _id: "_id"
-                problem_count = await db[collection_name].count_documents({"_id": "_id"})
-                
-                if problem_count > 0:
-                    logger.warning(f"Dropping problem collection: {collection_name}")
-                    await db[collection_name].drop()
-        
-        logger.info("Problem collection cleanup completed")
-        return True
-    except Exception as e:
-        logger.error(f"Error during problem collection cleanup: {e}")
-        return False
+        logger.error(f"Error initializing person clustering database: {e}")
+        raise e
+    
 def get_face_embedding_model(bucket_name: str, sub_bucket: str):
-    """Create dynamic FaceEmbedding model for specific bucket - FIXED"""
+    """Create dynamic FaceEmbedding model for specific bucket"""
     collection_name = f"face_embeddings_{bucket_name}_{sub_bucket}".replace("/", "_").replace("-", "_").lower()
     
     cache_key = f"face_embedding_{collection_name}"
@@ -193,7 +757,7 @@ def get_face_embedding_model(bucket_name: str, sub_bucket: str):
     return DynamicFaceEmbedding
 
 def get_clustering_result_model(bucket_name: str, sub_bucket: str):
-    """Create a dynamic ClusteringResult model for specific bucket - FIXED"""
+    """Create a dynamic ClusteringResult model for specific bucket"""
     collection_name = f"clustering_results_{bucket_name}_{sub_bucket}".replace("/", "_").replace("-", "_").lower()
     
     cache_key = f"clustering_result_{collection_name}"
@@ -210,104 +774,8 @@ def get_clustering_result_model(bucket_name: str, sub_bucket: str):
     _model_cache[cache_key] = DynamicClusteringResult
     return DynamicClusteringResult
 
-class DatabaseSynchronizer:
-    """Utility to keep Qdrant and MongoDB in sync"""
-    
-    @staticmethod
-    async def verify_consistency(bucket_name: str, sub_bucket: str) -> Dict[str, Any]:
-        """Verify that both databases have the same data"""
-        try:
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            
-            # Get all MongoDB face IDs
-            mongo_face_ids: Set[str] = set()
-            async for face in FaceEmbeddingModel.find_all():
-                mongo_face_ids.add(face.face_id)
-            
-            # Get all Qdrant IDs
-            qdrant_ids = set()
-            try:
-                points = qdrant_service.get_all_face_ids()
-                qdrant_ids = set(points)
-            except Exception as e:
-                logger.error(f"Error getting Qdrant IDs: {e}")
-            
-            # Find discrepancies
-            missing_in_qdrant = mongo_face_ids - qdrant_ids
-            missing_in_mongo = qdrant_ids - mongo_face_ids
-            
-            return {
-                "mongo_count": len(mongo_face_ids),
-                "qdrant_count": len(qdrant_ids),
-                "missing_in_qdrant": list(missing_in_qdrant),
-                "missing_in_mongo": list(missing_in_mongo),
-                "consistent": not (missing_in_qdrant or missing_in_mongo)
-            }
-            
-        except Exception as e:
-            logger.error(f"Consistency check failed: {e}")
-            return {"error": str(e)}
-    
-    @staticmethod
-    async def repair_inconsistencies(bucket_name: str, sub_bucket: str) -> Dict[str, Any]:
-        """Attempt to repair inconsistencies between databases"""
-        try:
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            report = await DatabaseSynchronizer.verify_consistency(bucket_name, sub_bucket)
-            
-            if report.get("consistent", False):
-                return {"status": "already_consistent", "report": report}
-                
-            # Repair faces missing in Qdrant
-            if report["missing_in_qdrant"]:
-                missing_faces = await FaceEmbeddingModel.find(
-                    {"face_id": {"$in": list(report["missing_in_qdrant"])}}
-                ).to_list()
-                
-                for face in missing_faces:
-                    await face.delete()
-                    logger.warning(f"Deleted MongoDB document for face_id {face.face_id} - missing in Qdrant")
-                    
-            # Repair faces missing in MongoDB
-            if report["missing_in_mongo"]:
-                qdrant_faces = qdrant_service.get_embeddings_by_face_ids(
-                    list(report["missing_in_mongo"])
-                )
-                
-                for face_data in qdrant_faces:
-                    payload = face_data["payload"]
-                    
-                    # Create MongoDB entry
-                    clustering_id = payload.get("clustering_id")
-                    if clustering_id and ObjectId.is_valid(clustering_id):
-                        clustering_id = ObjectId(clustering_id)
-                    
-                    face_doc = FaceEmbeddingModel(
-                        face_id=payload.get("face_id", str(uuid.uuid4())),
-                        image_path=payload.get("image_path", ""),
-                        bbox=eval(payload["bbox"]) if payload.get("bbox") else None,
-                        confidence=float(payload["confidence"]) if payload.get("confidence") else None,
-                        quality_score=float(payload["quality_score"]) if payload.get("quality_score") else None,
-                        clustering_id=clustering_id,
-                        cluster_id=payload.get("cluster_id", "unassigned")
-                    )
-                    
-                    await face_doc.insert()
-                    logger.info(f"Recovered MongoDB entry for face_id {face_doc.face_id}")
-            
-            return {
-                "status": "repair_attempted",
-                "original_report": report,
-                "new_status": await DatabaseSynchronizer.verify_consistency(bucket_name, sub_bucket)
-            }
-            
-        except Exception as e:
-            logger.error(f"Repair failed: {e}")
-            return {"status": "failed", "error": str(e)}
-
 class FaceClusteringDB:
     """Utility class for managing face clustering database operations"""
-    
     
     @staticmethod
     async def save_face_metadata(
@@ -319,34 +787,39 @@ class FaceClusteringDB:
         quality_score: Optional[float] = None,
         clustering_id: Optional[ObjectId] = None
     ) -> Optional[str]:
-        """Save face metadata to MongoDB (without embedding) - FIXED"""
+        """Save face metadata to MongoDB (without embedding)"""
         try:
             FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
             
             if not await initialize_dynamic_model(FaceEmbeddingModel):
                 raise Exception("Failed to initialize dynamic model")
             
-            # Create document with explicit ObjectId
-            face_doc = FaceEmbeddingModel(
-                id=ObjectId(),
-                face_id=str(uuid.uuid4()),
-                image_path=image_path,
-                bbox=bbox,
-                confidence=confidence,
-                quality_score=quality_score,
-                clustering_id=clustering_id,
-                embedding=[]  # Empty embedding for metadata-only storage
-            )
-                
-            # Use insert() method
-            await face_doc.insert()
+            face_id = str(uuid.uuid4())
             
-            logger.info(f"Successfully saved face metadata for {image_path} with face_id {face_doc.face_id}")
-            return face_doc.face_id
+            # Create document data directly
+            doc_data = {
+                "_id": ObjectId(),
+                "face_id": face_id,
+                "image_path": image_path,
+                "bbox": bbox,
+                "confidence": confidence,
+                "quality_score": quality_score,
+                "clustering_id": clustering_id,
+                "embedding": [],  # Empty embedding for metadata-only storage
+                "timestamp": datetime.utcnow()
+            }
+                
+            # Insert directly using motor collection
+            await FaceEmbeddingModel._motor_collection.insert_one(doc_data)
+            
+            logger.info(f"Successfully saved face metadata for {image_path} with face_id {face_id}")
+            return face_id
             
         except Exception as e:
             logger.error(f"Error saving face metadata for {image_path}: {str(e)}", exc_info=True)
             return None
+
+    @staticmethod
     async def save_clustering_result_as_metadata(
         bucket_name: str,
         sub_bucket: str,
@@ -355,12 +828,7 @@ class FaceClusteringDB:
         face_id_mapping: Dict[str, str],
         processing_stats: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Save clustering result as metadata only.
-        - Ensures top-level `timestamp` is a datetime (not the literal string "timestamp")
-        - Ensures `processing_stats["timestamp"]` is a proper datetime (or ISO string)
-        - Calculates total_images correctly from all cluster image_paths + noise
-        """
+        """Save clustering result as metadata only"""
         try:
             # normalize stats & timestamps
             processing_stats = processing_stats or {}
@@ -368,7 +836,6 @@ class FaceClusteringDB:
             if ts is None:
                 processing_stats["timestamp"] = datetime.utcnow()
             else:
-                # tolerate strings; coerce to datetime where possible
                 if isinstance(ts, str):
                     try:
                         processing_stats["timestamp"] = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -384,14 +851,12 @@ class FaceClusteringDB:
                     fid = face_id_mapping.get(p)
                     if fid:
                         face_ids.append(fid)
-                cluster_infos.append(
-                    ClusterInfo(
-                        cluster_id=cluster_id,
-                        image_paths=image_paths,
-                        face_ids=face_ids,
-                        size=len(image_paths),
-                    )
-                )
+                cluster_infos.append({
+                    "cluster_id": cluster_id,
+                    "image_paths": image_paths,
+                    "face_ids": face_ids,
+                    "size": len(image_paths),
+                })
 
             # noise face_ids
             noise_face_ids = []
@@ -412,32 +877,33 @@ class FaceClusteringDB:
             if not ok:
                 raise RuntimeError("Failed to initialize clustering result model")
 
-            # write document (top-level timestamp must be datetime)
-            doc = ClusteringResultModel(
-                id=ObjectId(),
-                bucket_path=f"{bucket_name}/{sub_bucket}",
-                clusters=cluster_infos,
-                noise=noise,
-                noise_face_ids=noise_face_ids,
-                total_images=total_images,
-                total_faces=total_faces,
-                num_clusters=num_clusters,
-                processing_stats=processing_stats,
-                timestamp=datetime.utcnow(),
-            )
-            await doc.insert()
-            logger.info("Saved clustering metadata: %s", str(doc.id))
-            return doc.id
+            # Create document data directly
+            doc_id = ObjectId()
+            doc_data = {
+                "_id": doc_id,
+                "bucket_path": f"{bucket_name}/{sub_bucket}",
+                "clusters": cluster_infos,
+                "noise": noise,
+                "noise_face_ids": noise_face_ids,
+                "total_images": total_images,
+                "total_faces": total_faces,
+                "num_clusters": num_clusters,
+                "processing_stats": _convert_numpy_types(processing_stats),
+                "timestamp": datetime.utcnow(),
+            }
+            
+            # Insert directly using motor collection
+            await ClusteringResultModel._motor_collection.insert_one(doc_data)
+            logger.info("Saved clustering metadata: %s", str(doc_id))
+            return doc_id
         except Exception as e:
             logger.error("Error saving clustering metadata: %s", e, exc_info=True)
             return None
+
     @staticmethod
     async def cleanup_problem_documents(bucket_name: str, sub_bucket: str):
         """Clean up documents with invalid _id values"""
         try:
-            from motor.motor_asyncio import AsyncIOMotorClient
-            from app.core.config import settings
-            
             client = AsyncIOMotorClient(settings.MONGODB_URL)
             db = client[settings.DATABASE_NAME]
             
@@ -456,8 +922,7 @@ class FaceClusteringDB:
             logger.info(f"Cleaned problem documents from {collection_name}")
         except Exception as e:
             logger.error(f"Error cleaning problem documents: {e}")
-    
-    
+
     @staticmethod
     async def save_complete_clustering_pipeline_fixed(
         bucket_name: str,
@@ -469,10 +934,7 @@ class FaceClusteringDB:
         face_id_mapping: Dict[str, str],          # image_path -> face_id
         processing_stats: Optional[Dict[str, Any]] = None,
     ) -> Optional[ObjectId]:
-        """
-        Complete pipeline with separated storage: MongoDB (metadata) + Qdrant (vectors).
-        Ensures timestamps are always valid datetimes and never the literal "timestamp".
-        """
+        """Complete pipeline with separated storage: MongoDB (metadata) + Qdrant (vectors)"""
         try:
             logger.info("Starting complete clustering pipeline for %s/%s", bucket_name, sub_bucket)
 
@@ -560,22 +1022,17 @@ class FaceClusteringDB:
         face_ids: List[str],
         clustering_id: ObjectId
     ) -> bool:
-        """Update face metadata with clustering_id reference - FIXED"""
+        """Update face metadata with clustering_id reference"""
         try:
             FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
             
-            updated_count = 0
-            for face_id in face_ids:
-                try:
-                    face_doc = await FaceEmbeddingModel.find_one({"face_id": face_id})
-                    if face_doc:
-                        face_doc.clustering_id = clustering_id
-                        await face_doc.save()
-                        updated_count += 1
-                except Exception as e:
-                    logger.warning(f"Failed to update face_id {face_id}: {e}")
-                    continue
-                    
+            # Use direct MongoDB update operation
+            result = await FaceEmbeddingModel._motor_collection.update_many(
+                {"face_id": {"$in": face_ids}},
+                {"$set": {"clustering_id": clustering_id}}
+            )
+            
+            updated_count = result.modified_count
             logger.info(f"Updated {updated_count}/{len(face_ids)} face metadata entries with clustering_id {clustering_id}")
             return updated_count > 0
             
@@ -583,6 +1040,7 @@ class FaceClusteringDB:
             logger.error(f"Error updating face metadata with clustering_id: {e}")
             return False
 
+    @staticmethod
     async def save_embeddings_to_qdrant_with_metadata(
         clustering_id: str,
         bucket_name: str,
@@ -593,15 +1051,12 @@ class FaceClusteringDB:
         noise: List[str],
         face_id_mapping: Dict[str, str]
     ) -> bool:
-        """Save embeddings to Qdrant with proper clustering metadata - FIXED"""
+        """Save embeddings to Qdrant with proper clustering metadata"""
         try:
             logger.info(f"[QDRANT] Starting to save embeddings for clustering {clustering_id}")
             
             # Prepare data for batch insertion
             embeddings = []
-            face_ids = []
-            image_paths = []
-            cluster_ids = []
             payloads = []
             
             # Process clusters
@@ -618,9 +1073,6 @@ class FaceClusteringDB:
                     metadata = face_metadata.get(face_id, {})
                     
                     embeddings.append(embedding)
-                    face_ids.append(face_id)
-                    image_paths.append(f"{bucket_name}/{image_path}")
-                    cluster_ids.append(cluster_id)
                     
                     # Create payload with all metadata
                     payload = {
@@ -647,9 +1099,6 @@ class FaceClusteringDB:
                 metadata = face_metadata.get(face_id, {})
                 
                 embeddings.append(embedding)
-                face_ids.append(face_id)
-                image_paths.append(f"{bucket_name}/{image_path}")
-                cluster_ids.append("noise")
                 
                 payload = {
                     "face_id": face_id,
@@ -685,251 +1134,21 @@ class FaceClusteringDB:
         except Exception as e:
             logger.error(f"[QDRANT] Error saving embeddings with metadata: {e}")
             return False
-    
-    @staticmethod
-    async def update_face_embeddings_with_cluster_assignments(
-        bucket_name: str,
-        sub_bucket: str,
-        cluster_assignments: Dict[str, str],  # face_id -> cluster_id
-        clustering_id: ObjectId
-    ) -> bool:
-        """Update face embeddings with cluster assignments and clustering_id"""
-        try:
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            
-            updated_count = 0
-            for face_id, cluster_id in cluster_assignments.items():
-                # Update the document
-                result = await FaceEmbeddingModel.find_one({"face_id": face_id})
-                if result:
-                    result.cluster_id = cluster_id
-                    result.clustering_id = clustering_id
-                    await result.save()
-                    updated_count += 1
-                    
-            logger.info(f"Updated {updated_count} face embeddings with cluster assignments")
-            return updated_count > 0
-            
-        except Exception as e:
-            logger.error(f"Error updating face embeddings with cluster assignments: {e}")
-            return False
-    @staticmethod
-    async def update_face_embeddings_with_clustering_id(
-        bucket_name: str,
-        sub_bucket: str,
-        face_ids: List[str],
-        clustering_id: ObjectId
-    ) -> bool:
-        """Update face embeddings with clustering_id reference"""
-        try:
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            
-            # Update all face embeddings with the clustering_id
-            result = await FaceEmbeddingModel.find({"face_id": {"$in": face_ids}}).update_many(
-                {"$set": {"clustering_id": clustering_id}}
-            )
-            
-            # Also update Qdrant with clustering_id
-            await qdrant_service.update_clustering_ids(face_ids, str(clustering_id))
-            
-            logger.info(f"Updated {result.modified_count} face embeddings with clustering_id {clustering_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Error updating face embeddings with clustering_id: {e}")
-            return False
-
-    @staticmethod
-    async def update_cluster_assignments_with_qdrant(
-        bucket_name: str,
-        sub_bucket: str,
-        cluster_assignments: Dict[str, str],
-        clustering_id: ObjectId
-    ) -> bool:
-        """Update cluster assignments for faces in both MongoDB and Qdrant"""
-        try:
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            
-            # Get all faces that need updating
-            faces_to_update = []
-            for image_path, cluster_id in cluster_assignments.items():
-                face = await FaceEmbeddingModel.find_one({"image_path": image_path})
-                if face:
-                    faces_to_update.append({
-                        "face_id": face.face_id,
-                        "cluster_id": cluster_id,
-                        "image_path": image_path
-                    })
-            
-            # Update MongoDB
-            for face_update in faces_to_update:
-                await FaceEmbeddingModel.find_one({"face_id": face_update["face_id"]}).update(
-                    {"$set": {"cluster_id": face_update["cluster_id"]}}
-                )
-            
-            # Update Qdrant
-            face_ids = [f["face_id"] for f in faces_to_update]
-            cluster_ids = [f["cluster_id"] for f in faces_to_update]
-            
-            success = await qdrant_service.update_cluster_assignments(
-                face_ids, cluster_ids, str(clustering_id)
-            )
-            
-            if success:
-                logger.info(f"Updated {len(cluster_assignments)} cluster assignments in both databases")
-                return True
-            else:
-                logger.error("Failed to update Qdrant cluster assignments")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error updating cluster assignments: {e}")
-            return False
-
-    @staticmethod
-    async def save_complete_clustering_pipeline(
-        bucket_name: str,
-        sub_bucket: str,
-        face_data: List[Dict[str, Any]],
-        clusters: List[List[str]],
-        noise: List[str],
-        processing_stats: Optional[Dict] = None
-    ) -> Optional[ObjectId]:
-        try:
-            # Create face_id mapping first
-            face_id_mapping = {}
-            
-            # Save all face embeddings without clustering_id first
-            for face_info in face_data:
-                face_id = await FaceClusteringDB.save_face_embedding(
-                    bucket_name=bucket_name,
-                    sub_bucket=sub_bucket,
-                    image_path=face_info["image_path"],
-                    embedding=face_info["embedding"],
-                    bbox=face_info.get("bbox"),
-                    confidence=face_info.get("confidence"),
-                    quality_score=face_info.get("quality_score"),
-                    clustering_id=None
-                )
-                if face_id:
-                    face_id_mapping[face_info["image_path"]] = face_id
-            
-            # Save clustering result
-            clustering_result_id = await FaceClusteringDB.save_clustering_result(
-                bucket_name=bucket_name,
-                sub_bucket=sub_bucket,
-                clusters=clusters,
-                noise=noise,
-                face_id_mapping=face_id_mapping,
-                processing_stats=processing_stats
-            )
-            
-            if not clustering_result_id:
-                raise Exception("Failed to save clustering result")
-            
-            # Update all faces with clustering_id
-            await FaceClusteringDB.update_face_embeddings_with_clustering_id(
-                bucket_name=bucket_name,
-                sub_bucket=sub_bucket,
-                face_ids=list(face_id_mapping.values()),
-                clustering_id=clustering_result_id
-            )
-            
-            # Create cluster assignments
-            cluster_assignments = {}
-            for i, cluster_images in enumerate(clusters):
-                cluster_id = f"cluster_{i}"
-                for img_path in cluster_images:
-                    if img_path in face_id_mapping:
-                        cluster_assignments[face_id_mapping[img_path]] = cluster_id
-            
-            for img_path in noise:
-                if img_path in face_id_mapping:
-                    cluster_assignments[face_id_mapping[img_path]] = "noise"
-            
-            # Update cluster assignments
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            for face_id, cluster_id in cluster_assignments.items():
-                # Update MongoDB
-                await FaceEmbeddingModel.find_one({"face_id": face_id}).update(
-                    {"$set": {"cluster_id": cluster_id}}
-                )
-                
-                # Update Qdrant
-                qdrant_service.update_cluster_assignments(
-                    face_ids=[face_id],
-                    cluster_ids=[cluster_id],
-                    clustering_id=str(clustering_result_id)
-                )
-            
-            return clustering_result_id
-        except Exception as e:
-            logger.error(f"Error in clustering pipeline: {e}")
-            return None
-
-    @staticmethod
-    async def verify_cluster_data(bucket_name: str, sub_bucket: str, cluster_id: str):
-        """Verify that cluster data exists in both collections"""
-        try:
-            ClusteringResultModel = get_clustering_result_model(bucket_name, sub_bucket)
-            result = await ClusteringResultModel.find_one(
-                {"bucket_path": f"{bucket_name}/{sub_bucket}"},
-                sort=[("timestamp", -1)]
-            )
-            
-            if not result:
-                return {"status": "error", "message": "No clustering results found"}
-            
-            target_cluster = None
-            for cluster in result.clusters:
-                if cluster.cluster_id == cluster_id:
-                    target_cluster = cluster
-                    break
-                    
-            if not target_cluster:
-                return {"status": "error", "message": f"Cluster {cluster_id} not found in results"}
-            
-            FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            missing_faces = []
-            
-            for face_id in target_cluster.face_ids:
-                face = await FaceEmbeddingModel.find_one({"face_id": face_id})
-                if not face:
-                    missing_faces.append(face_id)
-            
-            return {
-                "status": "success",
-                "cluster_exists": True,
-                "clustering_id": str(result.id),
-                "total_faces": len(target_cluster.face_ids),
-                "missing_faces": missing_faces,
-                "missing_count": len(missing_faces)
-            }
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
 
     @staticmethod
     async def get_latest_clustering_result(bucket_name: str, sub_bucket: str):
-        """
-        Get the most recent clustering result for a bucket/sub_bucket.
-        - First, only consider docs whose `timestamp` is a MongoDB date (type 9)
-        - If none found, fallback to raw Motor, coerce bad `timestamp` and parse through the model
-        """
+        """Get the most recent clustering result for a bucket/sub_bucket"""
         try:
             path = f"{bucket_name}/{sub_bucket}"
             ClusteringResultModel = get_clustering_result_model(bucket_name, sub_bucket)
+            await initialize_dynamic_model(ClusteringResultModel)
 
-            # 1) Prefer documents where timestamp is a real BSON date
-            doc = await ClusteringResultModel.find(
-                {"bucket_path": path, "timestamp": {"$type": 9}}
-            ).sort([("timestamp", -1)]).limit(1).first_or_none()
-            if doc:
-                return doc
-
-            # 2) Fallback: raw driver sort by _id if some legacy docs have bad strings
-            client = AsyncIOMotorClient(settings.MONGODB_URL)
-            db = client[settings.DATABASE_NAME]
-            coll = db[ClusteringResultModel.Settings.name]
-            raw = await coll.find_one({"bucket_path": path}, sort=[("_id", -1)])
+            # Use direct MongoDB query
+            raw = await ClusteringResultModel._motor_collection.find_one(
+                {"bucket_path": path},
+                sort=[("timestamp", -1)]
+            )
+            
             if not raw:
                 return None
 
@@ -938,8 +1157,8 @@ class FaceClusteringDB:
             if not isinstance(ts, datetime):
                 raw["timestamp"] = datetime.utcnow()
 
-            # run through Beanie model validation to keep shape consistent
-            doc = ClusteringResultModel.model_validate(raw)
+            # run through model validation to keep shape consistent
+            doc = ClusteringResult.model_validate(raw)
             return doc
         except Exception as e:
             logger.error("Error getting clustering result: %s", e, exc_info=True)
@@ -950,10 +1169,11 @@ class FaceClusteringDB:
         """Get all faces in a specific cluster with only necessary fields"""
         try:
             FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
-            faces = []
-            async for face_doc in FaceEmbeddingModel.find(
+            await initialize_dynamic_model(FaceEmbeddingModel)
+            
+            faces = await FaceEmbeddingModel._motor_collection.find(
                 {"cluster_id": cluster_id},
-                projection={
+                {
                     "face_id": 1,
                     "image_path": 1,
                     "bbox": 1,
@@ -961,8 +1181,8 @@ class FaceClusteringDB:
                     "quality_score": 1,
                     "clustering_id": 1
                 }
-            ):
-                faces.append(face_doc)
+            ).to_list(length=None)
+            
             return faces
         except Exception as e:
             logger.error(f"Error getting cluster faces: {e}")
@@ -975,8 +1195,12 @@ class FaceClusteringDB:
             FaceEmbeddingModel = get_face_embedding_model(bucket_name, sub_bucket)
             ClusteringResultModel = get_clustering_result_model(bucket_name, sub_bucket)
             
-            face_result = await FaceEmbeddingModel.delete_all()
-            cluster_result = await ClusteringResultModel.delete_all()
+            await initialize_dynamic_model(FaceEmbeddingModel)
+            await initialize_dynamic_model(ClusteringResultModel)
+            
+            # Delete using direct MongoDB operations
+            face_result = await FaceEmbeddingModel._motor_collection.delete_many({})
+            cluster_result = await ClusteringResultModel._motor_collection.delete_many({})
             
             # Also delete from Qdrant
             qdrant_service.delete_by_bucket_path(f"{bucket_name}/{sub_bucket}")
@@ -989,82 +1213,9 @@ class FaceClusteringDB:
             logger.error(f"Error deleting bucket data: {e}")
             return {"deleted_face_embeddings": 0, "deleted_clustering_results": 0}
 
-
-class ConnectionManager:
-    """Manages database and external service connections"""
-    
-    @staticmethod
-    async def close_connections():
-        """Close any open connections"""
-        try:
-            import gc
-            gc.collect()
-        except Exception as e:
-            logger.error(f"Error closing connections: {e}")
-
-class DatabaseCleanup:
-    """Utility for cleaning up conflicting indexes and documents"""
-    
-    @staticmethod
-    async def drop_conflicting_indexes():
-        """Drop conflicting indexes if they exist"""
-        try:
-            client = AsyncIOMotorClient(settings.MONGODB_URL)
-            db = client[settings.DATABASE_NAME]
-            
-            collections = await db.list_collection_names()
-            
-            for collection_name in collections:
-                if "clustering_results" in collection_name:
-                    collection = db[collection_name]
-                    
-                    indexes = await collection.list_indexes().to_list(length=None)
-                    
-                    for index in indexes:
-                        if index.get("name") == "clustering_id_1":
-                            await collection.drop_index("clustering_id_1")
-                            logger.info(f"Dropped conflicting index 'clustering_id_1' from {collection_name}")
-                            
-            logger.info("Database cleanup completed")
-            
-        except Exception as e:
-            logger.error(f"Error during database cleanup: {e}")
-    
-    @staticmethod
-    async def clean_duplicate_documents(bucket_name: str, sub_bucket: str):
-        """Clean up any duplicate documents that might exist"""
-        try:
-            client = AsyncIOMotorClient(settings.MONGODB_URL)
-            db = client[settings.DATABASE_NAME]
-            
-            collection_name = f"clustering_results_{bucket_name}_{sub_bucket}".replace("/", "_").replace("-", "_").lower()
-            collection = db[collection_name]
-            
-            await collection.delete_many({
-                "_id": {"$in": ["_id", "id", "cluster", "clustering"]}
-            })
-            
-            count = await collection.count_documents({})
-            if count < 100:
-                await collection.drop()
-                logger.info(f"Dropped entire collection {collection_name}")
-            else:
-                logger.info(f"Cleaned problematic documents from {collection_name}")
-                
-        except Exception as e:
-            logger.error(f"Error cleaning duplicate documents: {e}")
-            try:
-                await collection.drop()
-                logger.info(f"Force-dropped collection {collection_name} due to cleanup error")
-            except Exception as drop_error:
-                logger.error(f"Failed to drop collection: {drop_error}")
-
-
-    
 async def init_face_clustering_db():
-    """Initialize the face clustering database collections - FIXED"""
+    """Initialize the face clustering database collections"""
     try:
-        # Initialize database connection
         await get_database()
         logger.info("Face clustering database initialized successfully")
         return True

@@ -272,30 +272,154 @@ async def debug_get_profile(user_id: str):
     """Debug endpoint to get specific user profile details"""
     try:
         from app.db.user_profile_operations import UserProfileDB
+        from app.models.user_profile import UserProfile
         
         validate_user_id(user_id)
-        profile = await UserProfileDB.get_user_profile(user_id)
         
-        if not profile:
-            return {"user_id": user_id, "exists": False, "profile": None}
+        # Try multiple approaches to get the user profile
+        profile_data = None
+        method_used = ""
         
-        # Return safe profile data
+        # Method 1: Try UserProfileDB
+        try:
+            profile = await UserProfileDB.get_user_profile(user_id)
+            if profile:
+                # Check if it's a Beanie document or raw dict
+                if hasattr(profile, 'dict'):
+                    profile_data = profile.dict()
+                    method_used = "UserProfileDB.get_user_profile() - Beanie document"
+                elif isinstance(profile, dict):
+                    profile_data = profile
+                    method_used = "UserProfileDB.get_user_profile() - dict"
+                else:
+                    # Convert to dict manually
+                    profile_data = {
+                        "user_id": getattr(profile, 'user_id', None),
+                        "embedding": getattr(profile, 'embedding', []),
+                        "confidence": getattr(profile, 'confidence', None),
+                        "quality_score": getattr(profile, 'quality_score', None),
+                        "created_at": getattr(profile, 'created_at', None),
+                        "updated_at": getattr(profile, 'updated_at', None),
+                        "bbox": getattr(profile, 'bbox', None)
+                    }
+                    method_used = "UserProfileDB.get_user_profile() - manual conversion"
+        except Exception as db_error:
+            logger.warning(f"UserProfileDB method failed: {db_error}")
+        
+        # Method 2: Try Beanie directly if UserProfileDB failed
+        if not profile_data:
+            try:
+                profile = await UserProfile.find_one(UserProfile.user_id == user_id)
+                if profile:
+                    profile_data = profile.dict() if hasattr(profile, 'dict') else profile.model_dump()
+                    method_used = "UserProfile.find_one() - Beanie direct"
+            except Exception as beanie_error:
+                logger.warning(f"Beanie direct method failed: {beanie_error}")
+        
+        # Method 3: Try direct MongoDB access as fallback
+        if not profile_data:
+            try:
+                from app.services.cluster_linker import _get_direct_database
+                client, database = await _get_direct_database()
+                
+                try:
+                    collection = database.user_profiles  # Adjust collection name if needed
+                    profile_doc = await collection.find_one({"user_id": user_id})
+                    
+                    if profile_doc:
+                        profile_data = profile_doc
+                        method_used = "Direct MongoDB access"
+                finally:
+                    client.close()
+            except Exception as direct_error:
+                logger.warning(f"Direct MongoDB method failed: {direct_error}")
+        
+        if not profile_data:
+            return {
+                "user_id": user_id, 
+                "exists": False, 
+                "profile": None,
+                "method_used": "None - profile not found with any method"
+            }
+        
+        # Safely extract data with proper error handling
+        embedding = profile_data.get("embedding", [])
+        embedding_size = 0
+        embedding_sample = []
+        
+        try:
+            if isinstance(embedding, list):
+                embedding_size = len(embedding)
+                embedding_sample = embedding[:5] if embedding else []  # First 5 values
+            else:
+                embedding_size = 0
+                embedding_sample = []
+        except Exception as e:
+            logger.warning(f"Error processing embedding: {e}")
+            embedding_size = 0
+            embedding_sample = []
+        
+        # Extract bbox info safely
+        bbox_info = None
+        bbox = profile_data.get("bbox")
+        if bbox:
+            try:
+                if isinstance(bbox, list) and len(bbox) >= 4:
+                    bbox_info = {
+                        "values": bbox,
+                        "width": bbox[2] - bbox[0] if len(bbox) >= 4 else None,
+                        "height": bbox[3] - bbox[1] if len(bbox) >= 4 else None
+                    }
+                elif isinstance(bbox, dict):
+                    bbox_info = bbox
+                else:
+                    bbox_info = {"raw_value": str(bbox), "type": type(bbox).__name__}
+            except Exception as e:
+                bbox_info = {"error": str(e), "raw_value": str(bbox)}
+        
+        # Return comprehensive profile data
         safe_profile = {
-            "user_id": profile.get("user_id"),
-            "embedding_size": len(profile.get("embedding", [])),
-            "confidence": profile.get("confidence"),
-            "quality_score": profile.get("quality_score"),
-            "created_at": profile.get("created_at"),
-            "updated_at": profile.get("updated_at"),
-            "has_bbox": bool(profile.get("bbox")),
-            "bbox": profile.get("bbox") if profile.get("bbox") else None
+            "user_id": profile_data.get("user_id"),
+            "embedding_size": embedding_size,
+            "embedding_sample": embedding_sample,
+            "confidence": profile_data.get("confidence"),
+            "quality_score": profile_data.get("quality_score"),
+            "created_at": profile_data.get("created_at"),
+            "updated_at": profile_data.get("updated_at"),
+            "has_bbox": bool(bbox),
+            "bbox_info": bbox_info,
+            "raw_fields": list(profile_data.keys()),
+            "method_used": method_used
         }
         
-        return {"user_id": user_id, "exists": True, "profile": safe_profile}
+        # Add assignment count if available
+        try:
+            from app.db.cluster_assignment_operations import ClusterAssignmentDB
+            assignment_summary = await ClusterAssignmentDB.get_user_cluster_summary(user_id)
+            safe_profile["assignment_summary"] = assignment_summary
+        except Exception as e:
+            safe_profile["assignment_error"] = str(e)
+        
+        return {
+            "user_id": user_id, 
+            "exists": True, 
+            "profile": safe_profile,
+            "debug_info": {
+                "data_retrieval_method": method_used,
+                "profile_data_type": type(profile_data).__name__,
+                "raw_field_count": len(profile_data) if profile_data else 0
+            }
+        }
         
     except Exception as e:
         logger.error(f"Error getting profile for {user_id}: {e}")
-        return {"user_id": user_id, "exists": False, "error": str(e)}
+        return {
+            "user_id": user_id, 
+            "exists": False, 
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "debug_info": "Check if user_id exists and database connection is working"
+        }
 
 @router.delete("/debug-profile/{user_id}", summary="Delete specific profile (debugging)")
 async def debug_delete_profile(user_id: str):

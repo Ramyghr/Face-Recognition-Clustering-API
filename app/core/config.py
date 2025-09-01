@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Clustering API"
     DEBUG: bool = False
     ENV: str = "dev"
-    # LOCAL_STORAGE_PATH: str = "./local-data"
-    # CLUSTER_INPUT_PATH: str = "./local-data/input"
-    # CLUSTER_OUTPUT_PATH: str = "./local-data/clustered"
+    LOCAL_STORAGE_PATH: str = "./local-data"
+    CLUSTER_INPUT_PATH: str = "./local-data/input"
+    CLUSTER_OUTPUT_PATH: str = "./local-data/clustered"
 
     # ======================
     # Model Paths
@@ -46,14 +46,42 @@ class Settings(BaseSettings):
     MIN_CONFIDENCE: float = 0.50
     BLUR_THRESHOLD: int = 90
     CENTER_MARGIN: float = 0.1
-    MAX_FACES_PER_IMAGE: int = 5
+    MAX_FACES_PER_IMAGE: int = 6
+    # ======================
+    # Person-Based Clustering Parameters
+    # ======================
+    PERSON_SIMILARITY_THRESHOLD: float = 0.75  # Threshold for assigning faces to same person
+    MIN_PERSON_FACES: int = 3  # Minimum faces needed to form a person cluster
+    OWNER_SELECTION_QUALITY_WEIGHT: float = 0.7  # Weight for quality in owner selection
+    OWNER_SELECTION_CONFIDENCE_WEIGHT: float = 0.3  # Weight for confidence in owner selection
+    
+    # Enhanced quality control for person clustering
+    PERSON_MIN_FACE_SIZE: int = 40  # Minimum face size for person clustering
+    PERSON_MIN_CONFIDENCE: float = 0.65  # Minimum confidence for person clustering
+    PERSON_QUALITY_THRESHOLD: float = 0.4  # Minimum quality score for person clustering
+    
+    # Person clustering optimization
+    ENABLE_CROSS_IMAGE_VALIDATION: bool = True  # Validate person assignments across images
+    ENABLE_POST_CLUSTER_MERGING: bool = True  # Post Merging
+    MAX_PERSON_CLUSTER_SIZE: int = 1000  # Maximum faces per person cluster
+    PERSON_MERGE_SIMILARITY_THRESHOLD: float = 0.83  # Threshold for merging similar persons
+    
+    # Storage optimization
+    SAVE_ALL_FACE_EMBEDDINGS: bool = False  # Save all embeddings or just owner embeddings
+    COMPRESS_NON_OWNER_EMBEDDINGS: bool = True  # Compress non-owner embeddings
+    
+    # ======================
+    # Backward Compatibility
+    # ======================
+    ENABLE_LEGACY_CLUSTERING: bool = True  # Keep old clustering methods available
+    DEFAULT_CLUSTERING_METHOD: str = "person_based"  # "person_based" or "traditional"
 
     # ======================
     # Clustering Parameters
     # ======================
-    CLUSTERING_DISTANCE_THRESHOLD: float = 0.20
-    SIMILARITY_THRESHOLD: float = 0.72
-    MERGE_THRESHOLD: float = 0.40
+    CLUSTERING_DISTANCE_THRESHOLD: float = 0.25
+    SIMILARITY_THRESHOLD: float = 0.78
+    MERGE_THRESHOLD: float = 0.28
     MIN_CLUSTER_SIZE: int = 3
     CLUSTER_EPS: float = 0.75
     CLUSTER_PROB_THRESHOLD: float = 0.45
@@ -108,7 +136,10 @@ class Settings(BaseSettings):
     # ======================
     #Assignment Similarity 
     # ======================
-    ASSIGNMENT_SIMILARITY_THRESHOLD: float = 0.65
+    ASSIGNMENT_SIMILARITY_THRESHOLD: float = 0.72
+    ENABLE_DUPLICATE_PERSON_DETECTION: bool = True  # Detect and merge duplicate persons
+    DUPLICATE_DETECTION_THRESHOLD: float = 0.85  # Threshold for detecting duplicate persons
+    MAX_INTER_CLUSTER_SIMILARITY: float = 0.7  # Maximum allowed similarity between different persons
     # ======================
     # Noise Handling
     # ======================
